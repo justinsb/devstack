@@ -998,7 +998,7 @@ if [[ "$ENABLED_SERVICES" =~ "swift" ]]; then
    sed "s,%SWIFT_LOGDIR%,${swift_log_dir}," $FILES/swift/rsyslog.conf | sudo \
        tee /etc/rsyslog.d/10-swift.conf
    sudo restart rsyslog
-   
+
    # We create two helper scripts :
    #
    # - swift-remakerings
@@ -1184,6 +1184,11 @@ if [[ "$ENABLED_SERVICES" =~ "key" ]]; then
     cp $FILES/keystone.conf $KEYSTONE_CONF
     sudo sed -e "s,%SQL_CONN%,$BASE_SQL_CONN/keystone,g" -i $KEYSTONE_CONF
     sudo sed -e "s,%DEST%,$DEST,g" -i $KEYSTONE_CONF
+    sudo sed -e "s,%SERVICE_TOKEN%,$SERVICE_TOKEN,g" -i $KEYSTONE_CONF
+
+    KEYSTONE_CATALOG=$KEYSTONE_DIR/etc/default_catalog.template
+    cp $FILES/default_catalog.template $KEYSTONE_CATALOG
+    sudo sed -e "s,%SERVICE_HOST%,$SERVICE_HOST,g" -i $KEYSTONE_CATALOG
 
     # keystone_data.sh creates our admin user and our ``SERVICE_TOKEN``.
     KEYSTONE_DATA=$KEYSTONE_DIR/bin/keystone_data.sh
