@@ -20,11 +20,22 @@
 # Sanity Check
 # ============
 
+HOSTNAME=`hostname`
+
+OS="linux"
+UNAME=`uname`
+
+if [[ ${UNAME} =~ (SunOS) ]]; then
+    	echo "Detected Illumos/OpenIndiana"
+    	OS="illumos"
+	DISTRO='openindiana'
+else
+	DISTRO=$(lsb_release -c -s)
+fi
+
 # Warn users who aren't on oneiric, but allow them to override check and attempt
 # installation with ``FORCE=yes ./stack``
-DISTRO=$(lsb_release -c -s)
-
-if [[ ! ${DISTRO} =~ (oneiric) ]]; then
+if [[ (! ${DISTRO} =~ (oneiric) ) && ( ! ${DISTRO} == 'openindiana' ) ]]; then
     echo "WARNING: this script has only been tested on oneiric"
     if [[ "$FORCE" != "yes" ]]; then
         echo "If you wish to run this script anyway run with FORCE=yes"
@@ -85,8 +96,32 @@ function apt_get() {
     [[ "$OFFLINE" = "True" ]] && return
     local sudo="sudo"
     [ "$(id -u)" = "0" ] && sudo="env"
-    $sudo DEBIAN_FRONTEND=noninteractive apt-get \
+    [[ "$OS" == "linux" ]] && $sudo DEBIAN_FRONTEND=noninteractive apt-get \
         --option "Dpkg::Options::=--force-confold" --assume-yes "$@"
+    [[ "$OS" == "illumos" ]] &&  $sudo pkg "$@"
+}
+
+function apt_get_update() {
+    [[ "$OS" == "linux" ]] && apt_get update
+    [[ "$OS" == "illumos" ]] && apt_get refresh
+}
+
+function apt_get_install() {
+    [[ "$OS" == "linux" ]] && apt_get install "$@"
+    if [[ "$OS" == "illumos" ]]; then
+	local installed=1
+	pkg list $@ || installed=0
+	if [[ "$installed" == 0 ]]; then	
+		local r=0
+		apt_get install --no-refresh "$@" || r=$?
+		if [[ ($r == 0) || ($r == 4) ]]; then
+			# 4 = no updates necessary (?)
+			echo "OK"
+		else
+			failed
+		fi
+	fi
+    fi
 }
 
 # Check to see if we are already running a stack.sh
@@ -110,7 +145,7 @@ if [[ $EUID -eq 0 ]]; then
 
     # since this script runs as a normal user, we need to give that user
     # ability to run sudo
-    dpkg -l sudo || apt_get update && apt_get install sudo
+    dpkg -l sudo || apt_get_update && apt_get_install sudo
 
     if ! getent passwd stack >/dev/null; then
         echo "Creating a user called stack"
@@ -186,7 +221,9 @@ Q_PORT=${Q_PORT:-9696}
 Q_HOST=${Q_HOST:-localhost}
 
 # Specify which services to launch.  These generally correspond to screen tabs
-ENABLED_SERVICES=${ENABLED_SERVICES:-g-api,g-reg,key,n-api,n-cpu,n-net,n-sch,n-vnc,horizon,mysql,rabbit,openstackx}
+DEFAULT_SERVICES=-g-api,g-reg,key,n-api,n-cpu,n-net,n-sch,n-vnc,mysql,rabbit,openstackx
+[[ ! "$OS" == "illumos" ]] && DEFAULT_SERVICES=${DEFAULT_SERVICES},horizon
+[[ "$ENABLED_SERVICES" == "" ]] && ENABLED_SERVICES=${DEFAULT_SERVICES}
 
 # Name of the lvm volume group to use/create for iscsi volumes
 VOLUME_GROUP=${VOLUME_GROUP:-nova-volumes}
@@ -456,9 +493,12 @@ function get_packages() {
     local file_to_parse="general"
     local service
 
+    local subdir="apts"
+    [[ "$OS" = "illumos" ]] && subdir="dpkgs"
+
     for service in ${ENABLED_SERVICES//,/ }; do
         # Allow individual services to specify dependencies
-        if [[ -e $FILES/apts/${service} ]]; then
+        if [[ -e $FILES/${subdir}/${service} ]]; then
             file_to_parse="${file_to_parse} $service"
         fi
         if [[ $service == n-* ]]; then
@@ -477,7 +517,7 @@ function get_packages() {
     done
 
     for file in ${file_to_parse}; do
-        local fname=${FILES}/apts/${file}
+        local fname=${FILES}/${subdir}/${file}
         local OIFS line package distros distro
         [[ -e $fname ]] || { echo "missing: $fname"; exit 1 ;}
 
@@ -508,9 +548,66 @@ function pip_install {
     sudo PIP_DOWNLOAD_CACHE=/var/cache/pip pip install --use-mirrors $@
 }
 
+function easy_install {
+    [[ "$OFFLINE" = "True" ]] && return
+    sudo easy_install $@
+}
+
+
+function install_python_gflags() {
+    [[ -f ~/openstack/python-gflags/python-gflags-1.7 ]] && return
+	mkdir -p ~/openstack/python-gflags
+	pushd ~/openstack/python-gflags
+
+	wget -N "http://python-gflags.googlecode.com/files/python-gflags-1.7.tar.gz"
+	tar zxf python-gflags-1.7.tar.gz
+	cd python-gflags-1.7
+	sudo python ./setup.py install
+	popd
+}
+
+function illumos_fixes {
+    [[ "$OS" != "illumos" ]] && return
+
+    # Git / curl certificates aren't configured correctly
+    if [[ ! -f /etc/curl/curlCA ]]; then
+        sudo mkdir -p /etc/curl
+        cat /etc/certs/CA/*.pem | sudo tee /etc/curl/curlCA > /dev/null
+    fi
+
+    # PyCrypto uses the 'wrong' path for gmp.h
+    [[ -f /usr/include/gmp.h ]] || sudo ln -s /usr/include/gmp/gmp.h /usr/include/gmp.h
+
+    # We need pip
+    easy_install pip
+
+    # Other dependencies that it's easiest to install here
+    # (we don't necessarily have packages for them)
+    # TODO: Should/can we install using pip?
+    easy_install netaddr
+    easy_install eventlet
+    pip_install lockfile #==0.8
+    pip_install WebOb #==1.0.8
+
+    pip_install boto
+    pip_install carrot
+    pip_install kombu
+    pip_install paste
+    pip_install PasteDeploy #==1.5.0
+    pip_install routes #==1.12.3
+    pip_install SQLAlchemy
+    pip_install sqlalchemy-migrate
+
+    apt_get_install python-mysql-26
+
+    install_python_gflags
+}
+
 # install apt requirements
-apt_get update
-apt_get install $(get_packages)
+apt_get_update
+apt_get_install $(get_packages)
+
+illumos_fixes
 
 # install python requirements
 pip_install `cat $FILES/pips/* | uniq`
@@ -638,7 +735,7 @@ fi
 # ---------
 
 if [[ $SYSLOG != "False" ]]; then
-    apt_get install -y rsyslog-relp
+    apt_get_install -y rsyslog-relp
     if [[ "$SYSLOG_HOST" = "$HOST_IP" ]]; then
         # Configure the master host to receive
         cat <<EOF >/tmp/90-stack-m.conf
@@ -659,13 +756,87 @@ fi
 # Rabbit
 # ---------
 
+function build_erlang() {
+    if [[ -d /opt/erlang_r14b04 ]]; then
+        return
+    fi
+
+    mkdir -p ~/openstack/erlang_r14
+    pushd ~/openstack/erlang_r14
+    wget -N "http://www.erlang.org/download/otp_src_R14B04.tar.gz"
+    tar zxf otp_src_R14B04.tar.gz
+ERLANG_HOME=/opt/erlang_r14b04
+cd otp_src_R14B04
+
+# Fix same bug as http://hg.services.openoffice.org/hg/cws/hr77/rev/966db5af43a8
+patch erts/emulator/drivers/common/inet_drv.c << EOF
+4169c4169
+< #ifdef SIOCGIFHWADDR
+---
+> #if defined(SIOCGIFHWADDR) && !defined(__sun)
+EOF
+
+LANG=C
+export LANG
+./configure --prefix=${ERLANG_HOME}
+gmake
+sudo gmake install
+}
+
+
+function build_rabbitmq() {
+    build_erlang
+
+    if [[ -f /usr/sbin/rabbitmq ]]; then
+        return
+    fi
+
+    mkdir -p ~/openstack/rabbitmq
+    pushd ~/openstack/rabbitmq
+    wget -N "http://www.rabbitmq.com/releases/rabbitmq-server/v2.7.1/rabbitmq-server-generic-unix-2.7.1.tar.gz"
+    tar zxf rabbitmq-server-generic-unix-2.7.1.tar.gz
+    sudo mv rabbitmq_server-2.7.1 /opt
+    cd /opt
+    sudo ln -s /opt/rabbitmq_server-2.7.1 /opt/rabbitmq
+    cd /usr/sbin/
+    sudo ln -s /opt/rabbitmq/sbin/rabbitmq
+    sudo ln -s /opt/rabbitmq/sbin/rabbitmqctl
+    sudo ln -s /opt/rabbitmq/sbin/rabbitmq-env
+    popd
+
+	sudo groupadd rabbitmq
+	sudo useradd -c "RabbitMQ user" -m -d /export/home/rabbitmq -g rabbitmq -s /bin/bash rabbitmq
+
+	sudo mkdir -p /var/lib/rabbitmq/mnesia
+	sudo mkdir -p /var/log/rabbitmq
+
+	sudo chown -R rabbitmq:rabbitmq /var/lib/rabbitmq
+	sudo chown -R rabbitmq:rabbitmq /var/log/rabbitmq
+
+	sudo svccfg import ${FILES}/smfs/rabbitmq.xml
+}
+
+function install_rabbitmq() {
+    if [[ "$OS" == "illumos" ]]; then
+        build_rabbitmq
+        return
+    fi
+
+    tfile=$(mktemp)
+    apt_get_install rabbitmq-server > "$tfile" 2>&1
+    cat "$tfile"
+    rm -f "$tfile"
+}
+
 if [[ "$ENABLED_SERVICES" =~ "rabbit" ]]; then
     # Install and start rabbitmq-server
     # the temp file is necessary due to LP: #878600
-    tfile=$(mktemp)
-    apt_get install rabbitmq-server > "$tfile" 2>&1
-    cat "$tfile"
-    rm -f "$tfile"
+    install_rabbitmq
+
+    # Copy the erlang cookie so the root user can use it
+    # TODO(justinsb): How does this work for other OSes?
+    sudo cp ~rabbitmq/.erlang.cookie /root/
+
     # change the rabbit password since the default is "guest"
     sudo rabbitmqctl change_password guest $RABBIT_PASSWORD
 fi
@@ -673,15 +844,22 @@ fi
 # Mysql
 # ---------
 
+function restart_service() {
+    sudo svcadm disable -s $@
+    sudo svcadm enable -s $@
+}
+
 if [[ "$ENABLED_SERVICES" =~ "mysql" ]]; then
 
     # Seed configuration with mysql password so that apt-get install doesn't
     # prompt us for a password upon install.
-    cat <<MYSQL_PRESEED | sudo debconf-set-selections
+    if [[ "$OS" = "linux" ]]; then
+cat <<MYSQL_PRESEED | sudo debconf-set-selections
 mysql-server-5.1 mysql-server/root_password password $MYSQL_PASSWORD
 mysql-server-5.1 mysql-server/root_password_again password $MYSQL_PASSWORD
 mysql-server-5.1 mysql-server/start_on_boot boolean true
 MYSQL_PRESEED
+    fi
 
     # while ``.my.cnf`` is not needed for openstack to function, it is useful
     # as it allows you to access the mysql databases via ``mysql nova`` instead
@@ -697,13 +875,23 @@ EOF
     fi
 
     # Install and start mysql-server
-    apt_get install mysql-server
+    [[ "$OS" = "linux" ]] && apt_get_install mysql-server
+    [[ "$OS" = "illumos" ]] && apt_get_install mysql-51
+    [[ "$OS" = "illumos" ]] && sudo svcadm enable mysql:version_51
+
+    # TODO: Clean up mysql's questionable users table??
+    sudo mysql -uroot -h127.0.0.1 -e "SET PASSWORD FOR 'root'@'${HOSTNAME}' = PASSWORD('$MYSQL_PASSWORD')" || echo "Ignoring failure to set root password"
+    sudo mysql -uroot -h127.0.0.1 -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('$MYSQL_PASSWORD')" || echo "Ignoring failure to set root password"
+    sudo mysql -uroot -h127.0.0.1 -e "SET PASSWORD FOR 'root'@'127.0.0.1' = PASSWORD('$MYSQL_PASSWORD')"  || echo "Ignoring failure to set root password"
+
     # Update the DB to give user ‘$MYSQL_USER’@’%’ full control of the all databases:
     sudo mysql -uroot -p$MYSQL_PASSWORD -h127.0.0.1 -e "GRANT ALL PRIVILEGES ON *.* TO '$MYSQL_USER'@'%' identified by '$MYSQL_PASSWORD';"
 
     # Edit /etc/mysql/my.cnf to change ‘bind-address’ from localhost (127.0.0.1) to any (0.0.0.0) and restart the mysql service:
     sudo sed -i 's/127.0.0.1/0.0.0.0/g' /etc/mysql/my.cnf
-    sudo service mysql restart
+    [[ "$OS" == "linux" ]] && sudo service mysql restart
+    [[ "$OS" == "illumos" ]] && restart_service mysql
+    sleep 5 # Give mysql time to become available
 fi
 
 
@@ -715,7 +903,7 @@ fi
 if [[ "$ENABLED_SERVICES" =~ "horizon" ]]; then
 
     # Install apache2, which is NOPRIME'd
-    apt_get install apache2 libapache2-mod-wsgi
+    apt_get_install apache2 libapache2-mod-wsgi
 
     # Horizon currently imports quantum even if you aren't using it.  Instead
     # of installing quantum we can create a simple module that will pass the
@@ -762,8 +950,8 @@ if [[ "$ENABLED_SERVICES" =~ "g-reg" ]]; then
     mkdir -p $GLANCE_IMAGE_DIR
 
     # (re)create glance database
-    mysql -u$MYSQL_USER -p$MYSQL_PASSWORD -e 'DROP DATABASE IF EXISTS glance;'
-    mysql -u$MYSQL_USER -p$MYSQL_PASSWORD -e 'CREATE DATABASE glance;'
+    mysql -u$MYSQL_USER -p$MYSQL_PASSWORD -h127.0.0.1 -e 'DROP DATABASE IF EXISTS glance;'
+    mysql -u$MYSQL_USER -p$MYSQL_PASSWORD -h127.0.0.1 -e 'CREATE DATABASE glance;'
 
     # Copy over our glance configurations and update them
     GLANCE_CONF=$GLANCE_DIR/etc/glance-registry.conf
@@ -805,7 +993,7 @@ if [[ "$ENABLED_SERVICES" =~ "n-api" ]]; then
 fi
 
 # Helper to clean iptables rules
-function clean_iptables() {
+function clean_iptables_linux() {
     # Delete rules
     sudo iptables -S -v | sed "s/-c [0-9]* [0-9]* //g" | grep "nova" | grep "\-A" |  sed "s/-A/-D/g" | awk '{print "sudo iptables",$0}' | bash
     # Delete nat rules
@@ -816,20 +1004,29 @@ function clean_iptables() {
     sudo iptables -S -v -t nat | sed "s/-c [0-9]* [0-9]* //g" | grep "nova" |  grep "\-N" | sed "s/-N/-X/g" | awk '{print "sudo iptables -t nat",$0}' | bash
 }
 
+function clean_iptables_illumos() {
+    echo "No ip tables cleaning done for illumos"
+}
+
+function clean_iptables() {
+    [[ "$OS" == "linux" ]] && clean_iptables_linux
+    [[ "$OS" == "illumos" ]] && clean_iptables_illumos
+}
+
 if [[ "$ENABLED_SERVICES" =~ "n-cpu" ]]; then
 
     # Virtualization Configuration
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    apt_get install libvirt-bin
+    [[ "$OS" == "linux" ]] && apt_get_install libvirt-bin
 
     # attempt to load modules: network block device - used to manage qcow images
-    sudo modprobe nbd || true
+    [[ "$OS" == "linux" ]] && sudo modprobe nbd || true
 
     # Check for kvm (hardware based virtualization).  If unable to initialize
     # kvm, we drop back to the slower emulation mode (qemu).  Note: many systems
     # come with hardware virtualization disabled in BIOS.
     if [[ "$LIBVIRT_TYPE" == "kvm" ]]; then
-        sudo modprobe kvm || true
+        [[ "$OS" == "linux" ]] && sudo modprobe kvm || true
         if [ ! -e /dev/kvm ]; then
             echo "WARNING: Switching to QEMU"
             LIBVIRT_TYPE=qemu
@@ -841,7 +1038,7 @@ if [[ "$ENABLED_SERVICES" =~ "n-cpu" ]]; then
     # to simulate multiple systems.
     if [[ "$LIBVIRT_TYPE" == "lxc" ]]; then
         if [[ "$DISTRO" > natty ]]; then
-            apt_get install cgroup-lite
+            apt_get_install cgroup-lite
         else
             cgline="none /cgroup cgroup cpuacct,memory,devices,cpu,freezer,blkio 0 0"
             sudo mkdir -p /cgroup
@@ -856,11 +1053,11 @@ if [[ "$ENABLED_SERVICES" =~ "n-cpu" ]]; then
 
     # The user that nova runs as needs to be member of libvirtd group otherwise
     # nova-compute will be unable to use libvirt.
-    sudo usermod -a -G libvirtd `whoami`
+    [[ "$OS" == "linux" ]] && sudo usermod -a -G libvirtd `whoami`
     # libvirt detects various settings on startup, as we potentially changed
     # the system configuration (modules, filesystems), we need to restart
     # libvirt to detect those changes.
-    sudo /etc/init.d/libvirt-bin restart
+    [[ "$OS" == "linux" ]] && sudo /etc/init.d/libvirt-bin restart
 
 
     # Instance Storage
@@ -966,7 +1163,7 @@ if [[ "$ENABLED_SERVICES" =~ "swift" ]]; then
 
        # We install the memcache server as this is will be used by the
        # middleware to cache the tokens auths for a long this is needed.
-       apt_get install memcached
+       apt_get_install memcached
 
        # We need a special version of bin/swift which understand the
        # OpenStack api 2.0, we download it until this is getting
@@ -1053,7 +1250,7 @@ if [[ "$ENABLED_SERVICES" =~ "n-vol" ]]; then
     #
     # By default, the backing file is 2G in size, and is stored in /opt/stack.
 
-    apt_get install iscsitarget-dkms iscsitarget
+    apt_get_install iscsitarget-dkms iscsitarget
 
     if ! sudo vgs $VOLUME_GROUP; then
         VOLUME_BACKING_FILE=${VOLUME_BACKING_FILE:-$DEST/nova-volumes-backing-file}
@@ -1096,6 +1293,11 @@ add_nova_flag "--allow_admin_api"
 add_nova_flag "--scheduler_driver=$SCHEDULER"
 add_nova_flag "--dhcpbridge_flagfile=$NOVA_DIR/bin/nova.conf"
 add_nova_flag "--fixed_range=$FIXED_RANGE"
+
+# Don't try to start the metadata service on illumos (it requires iptables)
+[[ "$OS" = "illumos" ]] && add_nova_flag "--enabled_apis=ec2,osapi_compute,osapi_volume"
+
+    
 if [[ "$ENABLED_SERVICES" =~ "quantum" ]]; then
     add_nova_flag "--network_manager=nova.network.quantum.manager.QuantumManager"
     add_nova_flag "--quantum_connection_host=$Q_HOST"
@@ -1292,7 +1494,7 @@ if [[ "$ENABLED_SERVICES" =~ "q-svc" ]]; then
     if [[ "$Q_PLUGIN" = "openvswitch" ]]; then
         # Install deps
         # FIXME add to files/apts/quantum, but don't install if not needed!
-        apt_get install openvswitch-switch openvswitch-datapath-dkms
+        apt_get_install openvswitch-switch openvswitch-datapath-dkms
         # Create database for the plugin/agent
         if [[ "$ENABLED_SERVICES" =~ "mysql" ]]; then
             mysql -u$MYSQL_USER -p$MYSQL_PASSWORD -e 'CREATE DATABASE IF NOT EXISTS ovs_quantum;'
@@ -1439,7 +1641,7 @@ if [[ "$ENABLED_SERVICES" =~ "g-reg" ]]; then
             RVAL=`glance add -A $SERVICE_TOKEN name="$IMAGE_NAME-ramdisk" is_public=true container_format=ari disk_format=ari < "$RAMDISK"`
             RAMDISK_ID=`echo $RVAL | cut -d":" -f2 | tr -d " "`
         fi
-        glance add -A $SERVICE_TOKEN name="${IMAGE_NAME%.img}" is_public=true container_format=ami disk_format=ami ${KERNEL_ID:+kernel_id=$KERNEL_ID} ${RAMDISK_ID:+ramdisk_id=$RAMDISK_ID} < <(zcat --force "${IMAGE}")
+        glance add -A $SERVICE_TOKEN name="${IMAGE_NAME%.img}" is_public=true container_format=ami disk_format=ami ${KERNEL_ID:+kernel_id=$KERNEL_ID} ${RAMDISK_ID:+ramdisk_id=$RAMDISK_ID} < <(zcat "${IMAGE}")
     done
 fi
 

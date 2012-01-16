@@ -1,0 +1,6 @@
+runtime/gcc
+python-26
+setuptools-26
+gcc-3
+header-math
+# The system provided erlang crashes with rabbitmq (it's an old version)
