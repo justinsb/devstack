@@ -15,6 +15,9 @@ set -o xtrace
 # Settings
 # ========
 
+# Common functions
+source ./helpers.sh
+
 # Use openrc + stackrc + localrc for settings
 pushd $(cd $(dirname "$0")/.. && pwd)
 source ./openrc
@@ -51,7 +54,7 @@ euca-authorize -P icmp -s 0.0.0.0/0 -t -1:-1 $SECGROUP
 
 # Test we can ping our floating ip within ASSOCIATE_TIMEOUT seconds
 ASSOCIATE_TIMEOUT=${ASSOCIATE_TIMEOUT:-10}
-if ! timeout $ASSOCIATE_TIMEOUT sh -c "while ! ping -c1 -w1 $FLOATING_IP; do sleep 1; done"; then
+if ! timeout $ASSOCIATE_TIMEOUT sh -c "while ! ${PING_CMD} $FLOATING_IP; do sleep 1; done"; then
     echo "Couldn't ping server with floating ip"
     exit 1
 fi

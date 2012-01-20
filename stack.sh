@@ -315,7 +315,8 @@ PUBLIC_INTERFACE=${PUBLIC_INTERFACE:-eth0}
 FIXED_RANGE=${FIXED_RANGE:-10.0.0.0/24}
 FIXED_NETWORK_SIZE=${FIXED_NETWORK_SIZE:-256}
 FLOATING_RANGE=${FLOATING_RANGE:-172.24.4.224/28}
-NET_MAN=${NET_MAN:-FlatDHCPManager}
+[[ "$OS" != "illumos" ]] && NET_MAN=${NET_MAN:-FlatDHCPManager}
+[[ "$OS" == "illumos" ]] && NET_MAN=${NET_MAN:-FlatManager}
 EC2_DMZ_HOST=${EC2_DMZ_HOST:-$SERVICE_HOST}
 FLAT_NETWORK_BRIDGE=${FLAT_NETWORK_BRIDGE:-br100}
 VLAN_INTERFACE=${VLAN_INTERFACE:-$PUBLIC_INTERFACE}
@@ -597,6 +598,7 @@ function illumos_fixes {
     pip_install routes #==1.12.3
     pip_install SQLAlchemy
     pip_install sqlalchemy-migrate
+    pip_install Cheetah
 
     apt_get_install python-mysql-26
 
@@ -1013,6 +1015,28 @@ function clean_iptables() {
     [[ "$OS" == "illumos" ]] && clean_iptables_illumos
 }
 
+function destroy_old_instances_linux() {
+    instances=`virsh list --all | grep $INSTANCE_NAME_PREFIX | sed "s/.*\($INSTANCE_NAME_PREFIX[0-9a-fA-F]*\).*/\1/g"`
+    if [ ! $instances = "" ]; then
+        echo $instances | xargs -n1 virsh destroy || true
+        echo $instances | xargs -n1 virsh undefine || true
+    fi
+}
+
+function destroy_old_instances_illumos() {
+    instances=""
+    instances=`svcs -H -o fmri svc:/site/kvm` || true
+    if [[ $instances != "" ]]; then
+        echo $instances | xargs -n1 svcadm disable -s || true
+        echo $instances | xargs -n1 svccfg delete || true
+    fi
+}
+
+function destroy_old_instances() {
+    [[ "$OS" == "linux" ]] && destroy_old_instances_linux
+    [[ "$OS" == "illumos" ]] && destroy_old_instances_illumos
+}
+
 if [[ "$ENABLED_SERVICES" =~ "n-cpu" ]]; then
 
     # Virtualization Configuration
@@ -1080,11 +1104,7 @@ if [[ "$ENABLED_SERVICES" =~ "n-cpu" ]]; then
     clean_iptables
 
     # Destroy old instances
-    instances=`virsh list --all | grep $INSTANCE_NAME_PREFIX | sed "s/.*\($INSTANCE_NAME_PREFIX[0-9a-fA-F]*\).*/\1/g"`
-    if [ ! $instances = "" ]; then
-        echo $instances | xargs -n1 virsh destroy || true
-        echo $instances | xargs -n1 virsh undefine || true
-    fi
+    destroy_old_instances
 
     # Clean out the instances directory.
     sudo rm -rf $NOVA_DIR/instances/*
@@ -1294,10 +1314,15 @@ add_nova_flag "--scheduler_driver=$SCHEDULER"
 add_nova_flag "--dhcpbridge_flagfile=$NOVA_DIR/bin/nova.conf"
 add_nova_flag "--fixed_range=$FIXED_RANGE"
 
-# Don't try to start the metadata service on illumos (it requires iptables)
-[[ "$OS" = "illumos" ]] && add_nova_flag "--enabled_apis=ec2,osapi_compute,osapi_volume"
+if [[ "$OS" == "illumos" ]]; then
+    # Don't try to start the metadata service on illumos (it requires iptables)
+    # add_nova_flag "--enabled_apis=ec2,osapi_compute,osapi_volume"
 
-    
+    # Use the illumos stuff
+    #add_nova_flag "--flat_network_bridge=br100"
+    add_nova_flag "--connection_type=illumos"
+fi
+
 if [[ "$ENABLED_SERVICES" =~ "quantum" ]]; then
     add_nova_flag "--network_manager=nova.network.quantum.manager.QuantumManager"
     add_nova_flag "--quantum_connection_host=$Q_HOST"
@@ -1336,7 +1361,9 @@ add_nova_flag "--ec2_dmz_host=$EC2_DMZ_HOST"
 add_nova_flag "--rabbit_host=$RABBIT_HOST"
 add_nova_flag "--rabbit_password=$RABBIT_PASSWORD"
 add_nova_flag "--glance_api_servers=$GLANCE_HOSTPORT"
-add_nova_flag "--force_dhcp_release"
+
+[[ "$OS" != "illumos" ]] && add_nova_flag "--force_dhcp_release"
+
 if [ -n "$INSTANCES_PATH" ]; then
     add_nova_flag "--instances_path=$INSTANCES_PATH"
 fi
@@ -1545,7 +1572,8 @@ fi
 # ``libvirtd`` to our user in this script, when nova-compute is run it is
 # within the context of our original shell (so our groups won't be updated).
 # Use 'sg' to execute nova-compute as a member of the libvirtd group.
-screen_it n-cpu "cd $NOVA_DIR && sg libvirtd $NOVA_DIR/bin/nova-compute"
+[[ "$OS" != "illumos" ]] && screen_it n-cpu "cd $NOVA_DIR && sg libvirtd $NOVA_DIR/bin/nova-compute"
+[[ "$OS" == "illumos" ]] && screen_it n-cpu "cd $NOVA_DIR && $NOVA_DIR/bin/nova-compute"
 screen_it n-vol "cd $NOVA_DIR && $NOVA_DIR/bin/nova-volume"
 screen_it n-net "cd $NOVA_DIR && $NOVA_DIR/bin/nova-network"
 screen_it n-sch "cd $NOVA_DIR && $NOVA_DIR/bin/nova-scheduler"
@@ -1599,6 +1627,7 @@ if [[ "$ENABLED_SERVICES" =~ "g-reg" ]]; then
 
         KERNEL=""
         RAMDISK=""
+	STREAM_IMAGE="cat"
         case "$IMAGE_FNAME" in
             *.tar.gz|*.tgz)
                 # Extract ami and aki files
@@ -1625,6 +1654,7 @@ if [[ "$ENABLED_SERVICES" =~ "g-reg" ]]; then
             *.img.gz)
                 IMAGE="$FILES/${IMAGE_FNAME}"
                 IMAGE_NAME=$(basename "$IMAGE" ".img.gz")
+                STREAM_IMAGE="zcat"
                 ;;
             *) echo "Do not know what to do with $IMAGE_FNAME"; false;;
         esac
@@ -1641,7 +1671,7 @@ if [[ "$ENABLED_SERVICES" =~ "g-reg" ]]; then
             RVAL=`glance add -A $SERVICE_TOKEN name="$IMAGE_NAME-ramdisk" is_public=true container_format=ari disk_format=ari < "$RAMDISK"`
             RAMDISK_ID=`echo $RVAL | cut -d":" -f2 | tr -d " "`
         fi
-        glance add -A $SERVICE_TOKEN name="${IMAGE_NAME%.img}" is_public=true container_format=ami disk_format=ami ${KERNEL_ID:+kernel_id=$KERNEL_ID} ${RAMDISK_ID:+ramdisk_id=$RAMDISK_ID} < <(zcat "${IMAGE}")
+        glance add -A $SERVICE_TOKEN name="${IMAGE_NAME%.img}" is_public=true container_format=ami disk_format=ami ${KERNEL_ID:+kernel_id=$KERNEL_ID} ${RAMDISK_ID:+ramdisk_id=$RAMDISK_ID} < <(${STREAM_IMAGE} "${IMAGE}")
     done
 fi
 

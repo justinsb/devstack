@@ -14,6 +14,9 @@ set -o xtrace
 # Settings
 # ========
 
+# Common functions
+source ./helpers.sh
+
 # Use openrc + stackrc + localrc for settings
 pushd $(cd $(dirname "$0")/.. && pwd)
 source ./openrc
@@ -98,7 +101,7 @@ if [ "$MULTI_HOST" = "0" ]; then
     # sometimes the first ping fails (10 seconds isn't enough time for the VM's
     # network to respond?), so let's ping for a default of 15 seconds with a
     # timeout of a second for each ping.
-    if ! timeout $BOOT_TIMEOUT sh -c "while ! ping -c1 -w1 $IP; do sleep 1; done"; then
+    if ! timeout $BOOT_TIMEOUT sh -c "while ! ${PING_CMD} $IP; do sleep 1; done"; then
         echo "Couldn't ping server"
         exit 1
     fi

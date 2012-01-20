@@ -19,6 +19,9 @@ set -o xtrace
 # Settings
 # ========
 
+# Common functions
+source ./helpers.sh
+
 # Use openrc + stackrc + localrc for settings
 pushd $(cd $(dirname "$0")/.. && pwd)
 source ./openrc
@@ -117,7 +120,7 @@ if [ "$MULTI_HOST" = "0" ]; then
     # sometimes the first ping fails (10 seconds isn't enough time for the VM's
     # network to respond?), so let's ping for a default of 15 seconds with a
     # timeout of a second for each ping.
-    if ! timeout $BOOT_TIMEOUT sh -c "while ! ping -c1 -w1 $IP; do sleep 1; done"; then
+    if ! timeout $BOOT_TIMEOUT sh -c "while ! ${PING_CMD} $IP; do sleep 1; done"; then
         echo "Couldn't ping server"
         exit 1
     fi
@@ -148,7 +151,7 @@ fi
 nova add-floating-ip $NAME $FLOATING_IP
 
 # test we can ping our floating ip within ASSOCIATE_TIMEOUT seconds
-if ! timeout $ASSOCIATE_TIMEOUT sh -c "while ! ping -c1 -w1 $FLOATING_IP; do sleep 1; done"; then
+if ! timeout $ASSOCIATE_TIMEOUT sh -c "while ! ${PING_CMD} $FLOATING_IP; do sleep 1; done"; then
     echo "Couldn't ping server with floating ip"
     exit 1
 fi
@@ -168,7 +171,7 @@ nova secgroup-delete-rule $SECGROUP icmp -1 -1 0.0.0.0/0
 # FIXME (anthony): make xs support security groups
 if [ "$VIRT_DRIVER" != "xenserver" ]; then
     # test we can aren't able to ping our floating ip within ASSOCIATE_TIMEOUT seconds
-    if ! timeout $ASSOCIATE_TIMEOUT sh -c "while ping -c1 -w1 $FLOATING_IP; do sleep 1; done"; then
+    if ! timeout $ASSOCIATE_TIMEOUT sh -c "while ${PING_CMD} $FLOATING_IP; do sleep 1; done"; then
         print "Security group failure - ping should not be allowed!"
         echo "Couldn't ping server with floating ip"
         exit 1
